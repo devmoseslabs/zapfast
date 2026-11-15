@@ -23,15 +23,6 @@ const BORDER: f32 = 2.0;
 /// The round button that keeps the crop, like the composer's send button.
 const KEEP: f32 = 36.0;
 
-/// A change asked for by the controls under the picture. It is recorded while
-/// the window is drawn and applied afterwards, so the edit is not consumed
-/// from inside the closure that borrows it.
-#[derive(Clone, Copy)]
-enum Change {
-    Reset,
-    Turn { clockwise: bool },
-}
-
 /// The cropper's layer.
 pub(crate) fn area_id() -> egui::Id {
     egui::Id::new("picture-editor")
