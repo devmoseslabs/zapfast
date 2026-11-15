@@ -58,10 +58,22 @@ pub fn inspect(bytes: &[u8]) -> Result<(u32, u32), String> {
 /// The picture turned by whole quarter turns clockwise, then cropped. The
 /// crop is measured in the turned picture, which is what the editor showed.
 pub fn edit(bytes: &[u8], crop: PictureCrop, turns: u8) -> Result<Edited, String> {
+    edit_with_markup(bytes, crop, turns, &[], &[])
+}
+
+/// Applies the crop, turn, brush strokes, emoji and sticker overlays in one
+/// raster pass, always starting from the original staged image.
+pub fn edit_with_markup(
+    bytes: &[u8],
+    crop: PictureCrop,
+    turns: u8,
+    strokes: &[crate::model::PictureStroke],
+    overlays: &[crate::model::PictureOverlay],
+) -> Result<Edited, String> {
     let picture = image::load_from_memory(bytes)
         .map_err(|error| format!("This picture could not be read: {error}"))?
         .to_rgba8();
-    turned_and_cropped(picture, crop, turns)
+    turned_and_cropped(picture, crop, turns, strokes, overlays)
 }
 
 /// The same for a pasted picture, which has no file to read back.
@@ -72,9 +84,22 @@ pub fn edit_pasted(
     crop: PictureCrop,
     turns: u8,
 ) -> Result<Edited, String> {
+    edit_pasted_with_markup(rgba, width, height, crop, turns, &[], &[])
+}
+
+/// The same as `edit_with_markup` for a picture pasted from the clipboard.
+pub fn edit_pasted_with_markup(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    crop: PictureCrop,
+    turns: u8,
+    strokes: &[crate::model::PictureStroke],
+    overlays: &[crate::model::PictureOverlay],
+) -> Result<Edited, String> {
     let picture = image::RgbaImage::from_raw(width.max(1), height.max(1), rgba.to_vec())
         .ok_or_else(|| "This picture could not be read".to_owned())?;
-    turned_and_cropped(picture, crop, turns)
+    turned_and_cropped(picture, crop, turns, strokes, overlays)
 }
 
 /// Turns and crops a staged picture, writes the result in `dir` beside the
@@ -88,11 +113,28 @@ pub fn write(
     turns: u8,
     dir: &Path,
 ) -> Result<PathBuf, String> {
+    write_with_markup(source, width, height, crop, turns, &[], &[], dir)
+}
+
+/// Renders all annotations into the rotated source before cropping and
+/// encoding. The source itself is never modified.
+pub fn write_with_markup(
+    source: &PictureSource,
+    width: u32,
+    height: u32,
+    crop: PictureCrop,
+    turns: u8,
+    strokes: &[crate::model::PictureStroke],
+    overlays: &[crate::model::PictureOverlay],
+    dir: &Path,
+) -> Result<PathBuf, String> {
     let picture = match source {
         PictureSource::File(path) => std::fs::read(path)
             .map_err(|error| error.to_string())
-            .and_then(|bytes| edit(&bytes, crop, turns)),
-        PictureSource::Pasted(rgba) => edit_pasted(rgba, width, height, crop, turns),
+            .and_then(|bytes| edit_with_markup(&bytes, crop, turns, strokes, overlays)),
+        PictureSource::Pasted(rgba) => {
+            edit_pasted_with_markup(rgba, width, height, crop, turns, strokes, overlays)
+        }
     }?;
     std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
     let name = super::sticker_store::content_hash(&picture.bytes);
@@ -106,18 +148,165 @@ fn turned_and_cropped(
     picture: image::RgbaImage,
     crop: PictureCrop,
     turns: u8,
+    strokes: &[crate::model::PictureStroke],
+    overlays: &[crate::model::PictureOverlay],
 ) -> Result<Edited, String> {
-    let picture = match turns % 4 {
+    let mut picture = match turns % 4 {
         1 => image::imageops::rotate90(&picture),
         2 => image::imageops::rotate180(&picture),
         3 => image::imageops::rotate270(&picture),
         _ => picture,
     };
+    composite_markup(&mut picture, strokes, overlays)?;
     let (width, height) = picture.dimensions();
     let crop = crop.clamped(width, height);
     let kept =
         image::imageops::crop_imm(&picture, crop.x, crop.y, crop.width, crop.height).to_image();
     encode(&kept)
+}
+
+/// Draws strokes and overlays into the turned source, before the crop is cut.
+fn composite_markup(
+    picture: &mut image::RgbaImage,
+    strokes: &[crate::model::PictureStroke],
+    overlays: &[crate::model::PictureOverlay],
+) -> Result<(), String> {
+    let (width, height) = picture.dimensions();
+    for stroke in strokes {
+        draw_stroke(picture, stroke, width, height);
+    }
+    for overlay in overlays {
+        let max_side = (width as f32 * 0.85).max(8.0);
+        let side = overlay.size.round().clamp(8.0, max_side) as u32;
+        let (center_x, center_y) = (
+            (overlay.x.clamp(0.0, 1.0) * width as f32).round() as i64,
+            (overlay.y.clamp(0.0, 1.0) * height as f32).round() as i64,
+        );
+        let layer = match &overlay.source {
+            crate::model::PictureOverlaySource::Emoji(cluster) => {
+                crate::emoji::warm_up();
+                let rendered = fastframe_emoji::get()
+                    .render(cluster, side)
+                    .ok_or_else(|| format!("Could not render emoji {cluster}"))?;
+                let mut rgba = image::RgbaImage::from_raw(
+                    rendered.size[0] as u32,
+                    rendered.size[1] as u32,
+                    rendered.rgba,
+                )
+                .ok_or_else(|| "Could not decode the rendered emoji".to_owned())?;
+                // fastframe-emoji returns premultiplied pixels; image's
+                // compositing routines expect straight-alpha RGBA.
+                for pixel in rgba.pixels_mut() {
+                    let alpha = u32::from(pixel[3]);
+                    if alpha == 0 {
+                        pixel[0] = 0;
+                        pixel[1] = 0;
+                        pixel[2] = 0;
+                    } else {
+                        for channel in 0..3 {
+                            pixel[channel] =
+                                (u32::from(pixel[channel]) * 255 / alpha).min(255) as u8;
+                        }
+                    }
+                }
+                rgba
+            }
+            crate::model::PictureOverlaySource::Sticker(path) => {
+                let source = image::open(path)
+                    .map_err(|error| format!("Could not read sticker: {error}"))?
+                    .to_rgba8();
+                let scale = side as f32 / source.width().max(source.height()).max(1) as f32;
+                let target_width = ((source.width() as f32 * scale).round() as u32).max(1);
+                let target_height = ((source.height() as f32 * scale).round() as u32).max(1);
+                image::imageops::resize(
+                    &source,
+                    target_width,
+                    target_height,
+                    image::imageops::FilterType::Lanczos3,
+                )
+            }
+        };
+        let (x, y) = (
+            center_x - i64::from(layer.width()) / 2,
+            center_y - i64::from(layer.height()) / 2,
+        );
+        image::imageops::overlay(picture, &layer, x, y);
+    }
+    Ok(())
+}
+
+/// Paints a round-capped freehand line into the source RGBA pixels.
+fn draw_stroke(
+    picture: &mut image::RgbaImage,
+    stroke: &crate::model::PictureStroke,
+    width: u32,
+    height: u32,
+) {
+    let Some(first) = stroke.points.first() else {
+        return;
+    };
+    let radius = (stroke.width.max(1.0) / 2.0).max(0.5);
+    let point = |p: &crate::model::PicturePoint| {
+        (
+            p.x.clamp(0.0, 1.0) * width as f32,
+            p.y.clamp(0.0, 1.0) * height as f32,
+        )
+    };
+    if stroke.points.len() == 1 {
+        let (x, y) = point(first);
+        paint_disc(picture, x, y, radius, stroke.color);
+        return;
+    }
+    for pair in stroke.points.windows(2) {
+        let (x0, y0) = point(&pair[0]);
+        let (x1, y1) = point(&pair[1]);
+        let dx = x1 - x0;
+        let dy = y1 - y0;
+        let steps = dx.abs().max(dy.abs()).ceil().max(1.0) as usize;
+        for step in 0..=steps {
+            let t = step as f32 / steps as f32;
+            paint_disc(picture, x0 + dx * t, y0 + dy * t, radius, stroke.color);
+        }
+    }
+}
+
+/// Alpha-composites one round brush stamp, clipped to the picture bounds.
+fn paint_disc(
+    picture: &mut image::RgbaImage,
+    center_x: f32,
+    center_y: f32,
+    radius: f32,
+    color: [u8; 4],
+) {
+    let (width, height) = picture.dimensions();
+    let min_x = (center_x - radius).floor().max(0.0) as u32;
+    let max_x = (center_x + radius).ceil().min(width.saturating_sub(1) as f32) as u32;
+    let min_y = (center_y - radius).floor().max(0.0) as u32;
+    let max_y = (center_y + radius).ceil().min(height.saturating_sub(1) as f32) as u32;
+    let radius_sq = radius * radius;
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let dx = x as f32 + 0.5 - center_x;
+            let dy = y as f32 + 0.5 - center_y;
+            if dx * dx + dy * dy > radius_sq {
+                continue;
+            }
+            let pixel = picture.get_pixel_mut(x, y);
+            let alpha = u32::from(color[3]);
+            let inverse = 255 - alpha;
+            let out_alpha = alpha + (u32::from(pixel[3]) * inverse + 127) / 255;
+            if out_alpha == 0 {
+                continue;
+            }
+            for channel in 0..3 {
+                let foreground = u32::from(color[channel]) * alpha;
+                let background = u32::from(pixel[channel]) * u32::from(pixel[3]) * inverse / 255;
+                pixel[channel] =
+                    ((foreground + background + out_alpha / 2) / out_alpha).min(255) as u8;
+            }
+            pixel[3] = out_alpha.min(255) as u8;
+        }
+    }
 }
 
 /// Writes the picture as a PNG when any of it is see-through, so the crop
@@ -244,6 +433,67 @@ mod tests {
         )
         .expect("edits");
         assert_eq!(decoded(&bytes).dimensions(), (200, 120));
+    }
+
+    #[test]
+    fn brush_strokes_are_composited_before_the_crop() {
+        let stroke = crate::model::PictureStroke {
+            points: vec![
+                crate::model::PicturePoint { x: 0.25, y: 0.5 },
+                crate::model::PicturePoint { x: 0.75, y: 0.5 },
+            ],
+            color: [255, 0, 0, 255],
+            width: 6.0,
+        };
+        let edited = edit_with_markup(
+            &png(32, 32),
+            PictureCrop::full(32, 32),
+            0,
+            &[stroke],
+            &[],
+        )
+        .expect("renders the brush stroke");
+        let middle = decoded(&edited).get_pixel(16, 16).to_owned();
+        assert!(
+            middle[0] > middle[2],
+            "the red brush must be visible over the blue source: {middle:?}"
+        );
+    }
+
+    #[test]
+    fn a_sticker_overlay_is_composited_into_the_picture() {
+        use image::ImageEncoder;
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let sticker_path = directory.path().join("red.png");
+        let mut sticker_bytes = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut sticker_bytes)
+            .write_image(
+                image::RgbaImage::from_pixel(8, 8, image::Rgba([255, 0, 0, 255])).as_raw(),
+                8,
+                8,
+                image::ExtendedColorType::Rgba8,
+            )
+            .expect("encodes sticker");
+        std::fs::write(&sticker_path, sticker_bytes).expect("writes sticker");
+        let overlay = crate::model::PictureOverlay {
+            source: crate::model::PictureOverlaySource::Sticker(sticker_path),
+            x: 0.5,
+            y: 0.5,
+            size: 20.0,
+        };
+        let edited = edit_with_markup(
+            &png(32, 32),
+            PictureCrop::full(32, 32),
+            0,
+            &[],
+            &[overlay],
+        )
+        .expect("renders the sticker");
+        let middle = decoded(&edited).get_pixel(16, 16).to_owned();
+        assert!(
+            middle[0] > middle[2],
+            "the red sticker must be visible over the blue source: {middle:?}"
+        );
     }
 
     #[test]

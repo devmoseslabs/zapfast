@@ -4,7 +4,10 @@ use egui::{Align, Color32, Layout, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2, 
 
 use super::widgets;
 use crate::app::{App, Pending};
-use crate::model::{Action, CropEdge, PictureCrop, PictureSource};
+use crate::model::{
+    Action, CropEdge, PictureCrop, PictureEdit, PictureOverlay, PictureOverlaySource, PicturePoint,
+    PictureSource, PictureStroke, PictureTool,
+};
 use crate::theme::{self, Icon};
 
 /// Room left around the cropper, in points.
@@ -40,163 +43,492 @@ pub(crate) fn keep_note_id() -> egui::Id {
     egui::Id::new("picture-editor-keep")
 }
 
-/// Draws the cropper over the whole window and records whatever its controls
-/// asked for. The staged picture is left alone until the crop is kept.
+/// Draws the picture editor over the whole window. The staged attachment is
+/// not changed until the complete edit has been rendered successfully.
 pub fn show(app: &mut App, ctx: &egui::Context) {
     let Some(mut edit) = app.picture_edit.clone() else {
         return;
     };
     let palette = app.palette;
     let locale = app.locale;
-    // Captured before the edit is borrowed mutably, so the closure does not
-    // need the whole app.
     let source = edit.source.clone();
     let pasted = pasted_texture(app, ctx, &edit);
     let screen = ctx.content_rect();
     let mut actions = Vec::new();
-    let mut change = None;
-    // It covers the window, so it keeps the keyboard as the viewer does:
-    // Tab walks its own controls, never the chat hidden under it. The
-    // pointer already met only the cropper.
     ctx.memory_mut(|memory| {
         memory.set_modal_layer(egui::LayerId::new(egui::Order::Foreground, area_id()));
     });
+
     egui::Area::new(area_id())
         .order(egui::Order::Foreground)
         .fixed_pos(screen.min)
         .show(ctx, |ui| {
             let (rect, _) = ui.allocate_exact_size(screen.size(), Sense::hover());
-            // The window takes the theme's own colour, so the controls on it
-            // read in a light theme as in a dark one.
             ui.painter().rect_filled(rect, 0.0, palette.window);
+
             let room = rect.shrink(MARGIN);
             let top = Rect::from_min_size(room.min, vec2(room.width(), BAR));
-            let bottom =
-                Rect::from_min_size(pos2(room.min.x, room.max.y - BAR), vec2(room.width(), BAR));
+            let picker_height = if edit.picker_open { 92.0 } else { 0.0 };
+            let bottom_height = BAR + picker_height;
+            let bottom = Rect::from_min_size(
+                pos2(room.min.x, room.max.y - bottom_height),
+                vec2(room.width(), bottom_height),
+            );
             let (wide, tall) = edit.displayed_size();
-            let inner =
-                Rect::from_min_max(pos2(room.min.x, top.max.y), pos2(room.max.x, bottom.min.y));
+            let inner = Rect::from_min_max(
+                pos2(room.min.x, top.max.y),
+                pos2(room.max.x, bottom.min.y),
+            );
             let picture = fitted(vec2(wide as f32, tall as f32), inner);
             let scale = picture.width() / wide.max(1) as f32;
+            let crop_rect = to_screen(edit.crop, picture, scale);
+
             if let Some(id) = texture(ui, &source, pasted.as_ref(), picture.size()) {
                 paint_turned(ui, id, picture, edit.turns);
             }
-            // The region is kept in the picture's pixels, so a drag is turned
-            // into pixels before it is applied.
-            let moving = ui.interact(
-                to_screen(edit.crop, picture, scale),
-                ui.id().with("crop-inside"),
-                // `Sense::DRAG` is not focusable: a drag needs the pointer,
-                // and a focusable area is a nameless Tab stop.
-                Sense::DRAG,
-            );
-            if moving.dragged() {
-                let delta = moving.drag_delta() / scale;
-                edit.crop = edit.crop.drag(
-                    CropEdge::Inside,
-                    delta.x.round() as i64,
-                    delta.y.round() as i64,
-                    wide,
-                    tall,
+
+            // Existing strokes are painted into the live preview, in source
+            // coordinates, so their placement remains stable while cropping.
+            let picture_painter = ui.painter().with_clip_rect(crop_rect);
+            for stroke in &edit.strokes {
+                let points: Vec<Pos2> = stroke
+                    .points
+                    .iter()
+                    .map(|point| {
+                        pos2(
+                            picture.left() + point.x * picture.width(),
+                            picture.top() + point.y * picture.height(),
+                        )
+                    })
+                    .collect();
+                let color = Color32::from_rgba_unmultiplied(
+                    stroke.color[0],
+                    stroke.color[1],
+                    stroke.color[2],
+                    stroke.color[3],
                 );
+                if points.len() == 1 {
+                    picture_painter.circle_filled(
+                        points[0],
+                        (stroke.width * scale / 2.0).max(0.8),
+                        color,
+                    );
+                } else if points.len() > 1 {
+                    picture_painter.add(egui::Shape::line(
+                        points,
+                        Stroke::new((stroke.width * scale).max(1.0), color),
+                    ));
+                }
             }
-            for (edge, at) in handles(to_screen(edit.crop, picture, scale)) {
-                let grip = Rect::from_center_size(at, Vec2::splat(GRIP));
-                let response = ui
-                    .interact(grip, ui.id().with(("crop-edge", edge as u8)), Sense::DRAG)
-                    .on_hover_cursor(cursor(edge));
-                if response.dragged() {
-                    let delta = response.drag_delta() / scale;
+
+            // Overlay hit targets are only active in Select mode. The same
+            // normalized coordinates are used by the raster compositor.
+            for index in 0..edit.overlays.len() {
+                let overlay = edit.overlays[index].clone();
+                let center = pos2(
+                    picture.left() + overlay.x * picture.width(),
+                    picture.top() + overlay.y * picture.height(),
+                );
+                let side = (overlay.size * scale).clamp(16.0, picture.width().max(16.0));
+                let overlay_rect = Rect::from_center_size(center, Vec2::splat(side));
+                match &overlay.source {
+                    PictureOverlaySource::Emoji(cluster) => {
+                        crate::emoji::paint_cluster(ui, cluster, overlay_rect);
+                    }
+                    PictureOverlaySource::Sticker(path) => {
+                        widgets::file_image(ui, path)
+                            .fit_to_exact_size(overlay_rect.size())
+                            .paint_at(ui, overlay_rect);
+                    }
+                }
+                if edit.selected_overlay == Some(index) {
+                    ui.painter().rect_stroke(
+                        overlay_rect.expand(2.0),
+                        3.0,
+                        Stroke::new(1.5, palette.accent),
+                        StrokeKind::Inside,
+                    );
+                }
+                if edit.tool == PictureTool::Select {
+                    let response = ui
+                        .interact(
+                            overlay_rect.expand(3.0),
+                            ui.id().with(("picture-overlay", index)),
+                            Sense::click_and_drag(),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::Grab);
+                    if response.drag_started() {
+                        edit.checkpoint();
+                        edit.selected_overlay = Some(index);
+                    }
+                    if response.dragged() {
+                        edit.selected_overlay = Some(index);
+                        let delta = response.drag_delta();
+                        edit.overlays[index].x =
+                            (edit.overlays[index].x + delta.x / picture.width().max(1.0))
+                                .clamp(0.0, 1.0);
+                        edit.overlays[index].y =
+                            (edit.overlays[index].y + delta.y / picture.height().max(1.0))
+                                .clamp(0.0, 1.0);
+                        ctx.request_repaint();
+                    } else if response.clicked() {
+                        edit.selected_overlay = Some(index);
+                    }
+                }
+            }
+
+            // Crop and brush have mutually exclusive pointer ownership.
+            if edit.tool == PictureTool::Crop {
+                let moving = ui.interact(
+                    crop_rect,
+                    ui.id().with("crop-inside"),
+                    Sense::DRAG,
+                );
+                if moving.drag_started() {
+                    edit.checkpoint();
+                }
+                if moving.dragged() {
+                    let delta = moving.drag_delta() / scale.max(0.001);
                     edit.crop = edit.crop.drag(
-                        edge,
+                        CropEdge::Inside,
                         delta.x.round() as i64,
                         delta.y.round() as i64,
                         wide,
                         tall,
                     );
                 }
+                for (edge, at) in handles(to_screen(edit.crop, picture, scale)) {
+                    let grip = Rect::from_center_size(at, Vec2::splat(GRIP));
+                    let response = ui
+                        .interact(grip, ui.id().with(("crop-edge", edge as u8)), Sense::DRAG)
+                        .on_hover_cursor(cursor(edge));
+                    if response.drag_started() {
+                        edit.checkpoint();
+                    }
+                    if response.dragged() {
+                        let delta = response.drag_delta() / scale.max(0.001);
+                        edit.crop = edit.crop.drag(
+                            edge,
+                            delta.x.round() as i64,
+                            delta.y.round() as i64,
+                            wide,
+                            tall,
+                        );
+                    }
+                }
+            } else if edit.tool == PictureTool::Brush {
+                let response = ui
+                    .interact(
+                        crop_rect,
+                        ui.id().with("picture-brush-canvas"),
+                        Sense::drag(),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::Crosshair);
+                if response.drag_started() {
+                    edit.checkpoint();
+                    edit.strokes.push(PictureStroke {
+                        points: Vec::new(),
+                        color: edit.brush_color,
+                        width: edit.brush_width,
+                    });
+                }
+                if response.dragged() {
+                    if let Some(at) = response.interact_pointer_pos()
+                        && crop_rect.contains(at)
+                        && let Some(stroke) = edit.strokes.last_mut()
+                    {
+                        let point = PicturePoint {
+                            x: ((at.x - picture.left()) / picture.width().max(1.0))
+                                .clamp(0.0, 1.0),
+                            y: ((at.y - picture.top()) / picture.height().max(1.0))
+                                .clamp(0.0, 1.0),
+                        };
+                        let add = stroke.points.last().is_none_or(|previous| {
+                            let dx = (previous.x - point.x) * picture.width();
+                            let dy = (previous.y - point.y) * picture.height();
+                            dx * dx + dy * dy >= 4.0
+                        });
+                        if add {
+                            stroke.points.push(point);
+                        }
+                    }
+                    ctx.request_repaint();
+                }
             }
-            shade_outside(ui, palette, picture, to_screen(edit.crop, picture, scale));
+
+            shade_outside(
+                ui,
+                palette,
+                picture,
+                to_screen(edit.crop, picture, scale),
+                edit.tool == PictureTool::Crop,
+            );
+
+            // Tool selection and the existing cancel/send actions share the
+            // top bar. Text labels remain readable at narrow window widths.
             ui.scope_builder(
                 egui::UiBuilder::new()
                     .max_rect(top)
-                    .layout(Layout::right_to_left(Align::Center)),
+                    .layout(Layout::left_to_right(Align::Center)),
                 |ui| {
-                    let close = crate::i18n::gettext(locale, "Cancel (Esc)");
-                    if theme::icon_button(
-                        ui,
-                        Icon::X,
-                        18.0,
-                        palette.secondary,
-                        palette.text,
-                        &close,
-                    )
-                    .clicked()
-                    {
-                        actions.push(Action::CancelPictureEdit);
+                    for (tool, label) in [
+                        (PictureTool::Select, "Select"),
+                        (PictureTool::Crop, "Crop"),
+                        (PictureTool::Brush, "Draw"),
+                        (PictureTool::Emoji, "Emoji"),
+                        (PictureTool::Sticker, "Stickers"),
+                    ] {
+                        if theme::pill_button(ui, &palette, label, edit.tool == tool).clicked() {
+                            edit.tool = tool;
+                            edit.picker_open =
+                                matches!(tool, PictureTool::Emoji | PictureTool::Sticker);
+                            edit.picker_query.clear();
+                            if tool != PictureTool::Select {
+                                edit.selected_overlay = None;
+                            }
+                        }
                     }
-                    let keep = crate::i18n::gettext(locale, "Keep this crop");
-                    let kept = theme::circle_button(
-                        ui,
-                        Icon::Check,
-                        KEEP,
-                        palette.accent,
-                        palette.accent_hover,
-                        palette.on_accent,
-                        &keep,
-                    );
-                    ui.ctx()
-                        .data_mut(|data| data.insert_temp(keep_note_id(), kept.id));
-                    if kept.clicked() {
-                        actions.push(Action::ApplyPictureEdit);
-                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let close = crate::i18n::gettext(locale, "Cancel (Esc)");
+                        if theme::icon_button(
+                            ui,
+                            Icon::X,
+                            18.0,
+                            palette.secondary,
+                            palette.text,
+                            &close,
+                        )
+                        .clicked()
+                        {
+                            actions.push(Action::CancelPictureEdit);
+                        }
+                        let keep = crate::i18n::gettext(locale, "Send edited image");
+                        let kept = theme::circle_button(
+                            ui,
+                            Icon::Check,
+                            KEEP,
+                            palette.accent,
+                            palette.accent_hover,
+                            palette.on_accent,
+                            &keep,
+                        );
+                        ui.ctx()
+                            .data_mut(|data| data.insert_temp(keep_note_id(), kept.id));
+                        if kept.clicked() {
+                            actions.push(Action::ApplyPictureEdit);
+                        }
+                    });
                 },
             );
+
             ui.scope_builder(
                 egui::UiBuilder::new()
-                    .max_rect(bottom)
-                    .layout(Layout::right_to_left(Align::Center)),
+                    .max_rect(Rect::from_min_size(bottom.min, vec2(bottom.width(), BAR)))
+                    .layout(Layout::left_to_right(Align::Center)),
                 |ui| {
-                    let reset = crate::i18n::gettext(locale, "Reset");
-                    if theme::pill_button(ui, &palette, &reset, false).clicked() {
-                        change = Some(Change::Reset);
+                    if theme::pill_button(ui, &palette, "Undo", false).clicked() {
+                        edit.undo();
                     }
-                    let right = crate::i18n::gettext(locale, "Turn right");
-                    if theme::icon_button(
-                        ui,
-                        Icon::RotateRight,
-                        18.0,
-                        palette.secondary,
-                        palette.text,
-                        &right,
-                    )
-                    .clicked()
-                    {
-                        change = Some(Change::Turn { clockwise: true });
+                    if theme::pill_button(ui, &palette, "Redo", false).clicked() {
+                        edit.redo();
                     }
-                    let left = crate::i18n::gettext(locale, "Turn left");
                     if theme::icon_button(
                         ui,
                         Icon::RotateLeft,
                         18.0,
                         palette.secondary,
                         palette.text,
-                        &left,
+                        "Turn left",
                     )
                     .clicked()
                     {
-                        change = Some(Change::Turn { clockwise: false });
+                        edit = edit.turned(false);
+                    }
+                    if theme::icon_button(
+                        ui,
+                        Icon::RotateRight,
+                        18.0,
+                        palette.secondary,
+                        palette.text,
+                        "Turn right",
+                    )
+                    .clicked()
+                    {
+                        edit = edit.turned(true);
+                    }
+                    if theme::pill_button(ui, &palette, "Reset", false).clicked() {
+                        edit = edit.reset();
+                    }
+
+                    if edit.tool == PictureTool::Brush {
+                        ui.separator();
+                        for color in [
+                            [255, 255, 255, 255],
+                            [255, 82, 82, 255],
+                            [255, 214, 10, 255],
+                            [45, 190, 110, 255],
+                            [70, 145, 255, 255],
+                            [25, 25, 25, 255],
+                        ] {
+                            let (swatch, response) =
+                                ui.allocate_exact_size(Vec2::splat(19.0), Sense::click());
+                            ui.painter().circle_filled(
+                                swatch.center(),
+                                7.0,
+                                Color32::from_rgba_unmultiplied(
+                                    color[0], color[1], color[2], color[3],
+                                ),
+                            );
+                            if edit.brush_color == color {
+                                ui.painter().circle_stroke(
+                                    swatch.center(),
+                                    9.0,
+                                    Stroke::new(1.5, palette.accent),
+                                );
+                            }
+                            if response.clicked() {
+                                edit.brush_color = color;
+                            }
+                        }
+                        ui.add(
+                            egui::Slider::new(&mut edit.brush_width, 2.0..=64.0)
+                                .text("Brush")
+                                .show_value(false),
+                        );
+                    }
+
+                    if let Some(index) = edit.selected_overlay
+                        && index < edit.overlays.len()
+                    {
+                        if theme::pill_button(ui, &palette, "−", false).clicked() {
+                            edit.checkpoint();
+                            edit.overlays[index].size =
+                                (edit.overlays[index].size * 0.85).max(12.0);
+                        }
+                        if theme::pill_button(ui, &palette, "+", false).clicked() {
+                            edit.checkpoint();
+                            edit.overlays[index].size =
+                                (edit.overlays[index].size * 1.18).min(wide as f32 * 0.85);
+                        }
+                        if theme::pill_button(ui, &palette, "Delete", false).clicked() {
+                            edit.checkpoint();
+                            edit.overlays.remove(index);
+                            edit.selected_overlay = None;
+                        }
                     }
                 },
             );
+
+            if edit.picker_open {
+                let picker_rect = Rect::from_min_size(
+                    pos2(bottom.min.x, bottom.min.y + BAR),
+                    vec2(bottom.width(), picker_height),
+                );
+                ui.scope_builder(
+                    egui::UiBuilder::new().max_rect(picker_rect),
+                    |ui| match edit.tool {
+                        PictureTool::Emoji => {
+                            ui.horizontal(|ui| {
+                                ui.label("Search emoji");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut edit.picker_query)
+                                        .desired_width(180.0)
+                                        .hint_text("Search by name"),
+                                );
+                            });
+                            let query = edit.picker_query.trim().to_lowercase();
+                            let matches: Vec<&'static str> = emojis::iter()
+                                .filter(|emoji| {
+                                    query.is_empty()
+                                        || emoji.name().to_lowercase().contains(&query)
+                                        || emoji.shortcodes().any(|code| {
+                                            code.to_lowercase().contains(&query)
+                                        })
+                                })
+                                .take(72)
+                                .map(|emoji| emoji.as_str())
+                                .collect();
+                            egui::ScrollArea::horizontal()
+                                .id_salt("picture-emoji-picker")
+                                .show(ui, |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        for emoji in matches {
+                                            if ui.button(emoji).clicked() {
+                                                add_overlay(
+                                                    &mut edit,
+                                                    PictureOverlaySource::Emoji(emoji.to_owned()),
+                                                );
+                                            }
+                                        }
+                                    });
+                                });
+                        }
+                        PictureTool::Sticker => {
+                            let stickers = sticker_paths(app);
+                            if stickers.is_empty() {
+                                ui.label("No stickers available. Add stickers in the chat picker first.");
+                            } else {
+                                egui::ScrollArea::horizontal()
+                                    .id_salt("picture-sticker-picker")
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            for path in stickers {
+                                                let (tile, response) = ui.allocate_exact_size(
+                                                    Vec2::splat(48.0),
+                                                    Sense::click(),
+                                                );
+                                                widgets::file_image(ui, &path)
+                                                    .fit_to_exact_size(tile.size())
+                                                    .paint_at(ui, tile);
+                                                if response.clicked() {
+                                                    add_overlay(
+                                                        &mut edit,
+                                                        PictureOverlaySource::Sticker(path),
+                                                    );
+                                                }
+                                            }
+                                        });
+                                    });
+                            }
+                        }
+                        _ => {}
+                    },
+                );
+            }
         });
-    match change {
-        Some(Change::Reset) => edit = edit.reset(),
-        Some(Change::Turn { clockwise }) => edit = edit.turned(clockwise),
-        None => {}
-    }
+
     app.picture_edit = Some(edit);
     app.actions.extend(actions);
+}
+
+/// Adds an overlay centred in the currently selected crop.
+fn add_overlay(edit: &mut PictureEdit, source: PictureOverlaySource) {
+    let (width, height) = edit.displayed_size();
+    let crop = edit.crop.clamped(width, height);
+    edit.checkpoint();
+    edit.overlays.push(PictureOverlay {
+        source,
+        x: (crop.x as f32 + crop.width as f32 / 2.0) / width.max(1) as f32,
+        y: (crop.y as f32 + crop.height as f32 / 2.0) / height.max(1) as f32,
+        size: (width.min(height) as f32 * 0.18).clamp(24.0, (width as f32 * 0.6).max(24.0)),
+    });
+    edit.selected_overlay = Some(edit.overlays.len() - 1);
+    edit.tool = PictureTool::Select;
+    edit.picker_open = false;
+}
+
+/// Recent, saved, received and installed-pack stickers, deduplicated by path.
+fn sticker_paths(app: &App) -> Vec<std::path::PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    app.stickers
+        .iter()
+        .chain(app.stickers_saved.iter())
+        .chain(app.stickers_received.iter())
+        .chain(app.sticker_packs.iter().flat_map(|pack| pack.stickers.iter()))
+        .filter(|path| path.is_file() && seen.insert((*path).clone()))
+        .cloned()
+        .take(120)
+        .collect()
 }
 
 /// The largest rectangle of `shape`'s proportions centred in `room`.
@@ -359,7 +691,13 @@ fn cursor(edge: CropEdge) -> egui::CursorIcon {
 
 /// Fades what the crop leaves out toward the window, and marks the crop's
 /// border and handles in the theme's accent.
-fn shade_outside(ui: &egui::Ui, palette: theme::Palette, picture: Rect, crop: Rect) {
+fn shade_outside(
+    ui: &egui::Ui,
+    palette: theme::Palette,
+    picture: Rect,
+    crop: Rect,
+    show_handles: bool,
+) {
     let shade = palette.window.gamma_multiply(0.7);
     for outside in [
         Rect::from_min_max(picture.min, pos2(picture.max.x, crop.min.y)),
@@ -383,15 +721,17 @@ fn shade_outside(ui: &egui::Ui, palette: theme::Palette, picture: Rect, crop: Re
         Stroke::new(BORDER, palette.accent),
         StrokeKind::Inside,
     );
-    for (_, at) in handles(crop) {
-        let handle = Rect::from_center_size(at, Vec2::splat(HANDLE));
-        ui.painter().rect_filled(handle, 2.0, palette.accent);
-        ui.painter().rect_stroke(
-            handle,
-            2.0,
-            Stroke::new(1.0, palette.on_accent),
-            StrokeKind::Inside,
-        );
+    if show_handles {
+        for (_, at) in handles(crop) {
+            let handle = Rect::from_center_size(at, Vec2::splat(HANDLE));
+            ui.painter().rect_filled(handle, 2.0, palette.accent);
+            ui.painter().rect_stroke(
+                handle,
+                2.0,
+                Stroke::new(1.0, palette.on_accent),
+                StrokeKind::Inside,
+            );
+        }
     }
 }
 

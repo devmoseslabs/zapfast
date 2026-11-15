@@ -8075,12 +8075,22 @@ impl Worker {
                 height,
                 crop,
                 turns,
+                strokes,
+                overlays,
             } => {
                 let commands = self.commands.clone();
                 let dir = self.dirs.media_cache_dir().join("edited");
                 tokio::task::spawn_blocking(move || {
-                    let result =
-                        super::picture_edit::write(&source, width, height, crop, turns, &dir);
+                    let result = super::picture_edit::write_with_markup(
+                        &source,
+                        width,
+                        height,
+                        crop,
+                        turns,
+                        &strokes,
+                        &overlays,
+                        &dir,
+                    );
                     let _ = commands.send(Command::PictureEdited { target, result });
                 });
             }
