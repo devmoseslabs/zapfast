@@ -834,6 +834,8 @@ pub enum Command {
         height: u32,
         crop: crate::model::PictureCrop,
         turns: u8,
+        strokes: Vec<crate::model::PictureStroke>,
+        overlays: Vec<crate::model::PictureOverlay>,
     },
     /// Internal: the edited picture, ready to replace the staged attachment.
     PictureEdited {

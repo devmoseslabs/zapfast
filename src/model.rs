@@ -2285,6 +2285,60 @@ pub enum PictureSource {
     Pasted(Arc<Vec<u8>>),
 }
 
+/// The active image-editing tool.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PictureTool {
+    /// Select, move, and resize added overlays.
+    #[default]
+    Select,
+    Crop,
+    Brush,
+    Emoji,
+    Sticker,
+}
+
+/// A point on the source picture, normalized to its current displayed bounds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PicturePoint {
+    pub x: f32,
+    pub y: f32,
+}
+
+/// One freehand brush stroke. Width is measured in source-image pixels.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PictureStroke {
+    pub points: Vec<PicturePoint>,
+    pub color: [u8; 4],
+    pub width: f32,
+}
+
+/// The content placed on top of a picture.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PictureOverlaySource {
+    Emoji(String),
+    Sticker(PathBuf),
+}
+
+/// A movable overlay. Its centre is normalized to the displayed source image;
+/// size is measured in source-image pixels.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PictureOverlay {
+    pub source: PictureOverlaySource,
+    pub x: f32,
+    pub y: f32,
+    pub size: f32,
+}
+
+/// The undoable part of an image edit. Tool selection and picker text are UI
+/// state, not image content, and therefore are not part of the history.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PictureEditSnapshot {
+    pub crop: PictureCrop,
+    pub turns: u8,
+    pub strokes: Vec<PictureStroke>,
+    pub overlays: Vec<PictureOverlay>,
+}
+
 /// A staged picture on its way to being cropped and sent.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PictureEdit {
@@ -2298,6 +2352,20 @@ pub struct PictureEdit {
     pub crop: PictureCrop,
     /// Quarter turns clockwise already applied to the source.
     pub turns: u8,
+    /// Freehand marks in normalized coordinates on the displayed picture.
+    pub strokes: Vec<PictureStroke>,
+    /// Emoji and sticker images placed over the picture.
+    pub overlays: Vec<PictureOverlay>,
+    pub tool: PictureTool,
+    pub brush_color: [u8; 4],
+    /// Brush width in source-image pixels.
+    pub brush_width: f32,
+    /// Whether the inline emoji or sticker picker is open.
+    pub picker_open: bool,
+    pub picker_query: String,
+    pub selected_overlay: Option<usize>,
+    undo: Vec<PictureEditSnapshot>,
+    redo: Vec<PictureEditSnapshot>,
 }
 
 impl PictureEdit {
@@ -2315,7 +2383,61 @@ impl PictureEdit {
             height: height.max(1),
             crop: PictureCrop::full(width, height),
             turns: 0,
+            strokes: Vec::new(),
+            overlays: Vec::new(),
+            tool: PictureTool::Select,
+            brush_color: [255, 255, 255, 255],
+            brush_width: 18.0,
+            picker_open: false,
+            picker_query: String::new(),
+            selected_overlay: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
         }
+    }
+
+    fn snapshot(&self) -> PictureEditSnapshot {
+        PictureEditSnapshot {
+            crop: self.crop,
+            turns: self.turns,
+            strokes: self.strokes.clone(),
+            overlays: self.overlays.clone(),
+        }
+    }
+
+    /// Records one state before an editing gesture or command begins.
+    pub(crate) fn checkpoint(&mut self) {
+        self.undo.push(self.snapshot());
+        if self.undo.len() > 100 {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    /// Restores the previous edit operation.
+    pub(crate) fn undo(&mut self) {
+        let Some(previous) = self.undo.pop() else {
+            return;
+        };
+        self.redo.push(self.snapshot());
+        self.restore(previous);
+    }
+
+    /// Reapplies an operation that was undone.
+    pub(crate) fn redo(&mut self) {
+        let Some(next) = self.redo.pop() else {
+            return;
+        };
+        self.undo.push(self.snapshot());
+        self.restore(next);
+    }
+
+    fn restore(&mut self, snapshot: PictureEditSnapshot) {
+        self.crop = snapshot.crop;
+        self.turns = snapshot.turns;
+        self.strokes = snapshot.strokes;
+        self.overlays = snapshot.overlays;
+        self.selected_overlay = None;
     }
 
     /// The source turned to the side the crop is measured in.
@@ -2335,26 +2457,53 @@ impl PictureEdit {
         } else {
             self.crop.turned_counter_clockwise(width)
         };
-        Self {
-            turns: if clockwise {
-                (self.turns + 1) % 4
+        let mut next = self;
+        next.checkpoint();
+        next.turns = if clockwise {
+            (next.turns + 1) % 4
+        } else {
+            (next.turns + 3) % 4
+        };
+        next.crop = crop;
+        let rotate = |point: &mut PicturePoint| {
+            let (x, y) = (point.x, point.y);
+            if clockwise {
+                point.x = 1.0 - y;
+                point.y = x;
             } else {
-                (self.turns + 3) % 4
-            },
-            crop,
-            ..self
+                point.x = y;
+                point.y = 1.0 - x;
+            }
+        };
+        for stroke in &mut next.strokes {
+            for point in &mut stroke.points {
+                rotate(point);
+            }
         }
+        for overlay in &mut next.overlays {
+            let (x, y) = (overlay.x, overlay.y);
+            if clockwise {
+                overlay.x = 1.0 - y;
+                overlay.y = x;
+            } else {
+                overlay.x = y;
+                overlay.y = 1.0 - x;
+            }
+        }
+        next
     }
 
-    /// The whole picture again, the way it started: no turn and nothing
-    /// cropped away. This is what the editor's Reset does, so it has to undo
-    /// the turn as well as the region.
-    pub fn reset(self) -> Self {
-        Self {
-            crop: PictureCrop::full(self.width, self.height),
-            turns: 0,
-            ..self
-        }
+    /// Resets crop, rotation and all markup to the original picture.
+    pub fn reset(mut self) -> Self {
+        self.checkpoint();
+        self.crop = PictureCrop::full(self.width, self.height);
+        self.turns = 0;
+        self.strokes.clear();
+        self.overlays.clear();
+        self.selected_overlay = None;
+        self.picker_open = false;
+        self.tool = PictureTool::Select;
+        self
     }
 }
 
@@ -2368,6 +2517,8 @@ pub struct PictureOrigin {
     pub height: u32,
     pub crop: PictureCrop,
     pub turns: u8,
+    pub strokes: Vec<PictureStroke>,
+    pub overlays: Vec<PictureOverlay>,
 }
 
 /// A picture on its way to becoming a sticker.

@@ -8517,14 +8517,17 @@ impl App {
                     // with the crop it had, so cropping it again does not
                     // stack another lossy pass on the one before it.
                     if let Some(origin) = self.picture_origins.get(&target).cloned() {
-                        self.picture_edit = Some(crate::model::PictureEdit {
+                        let mut edit = crate::model::PictureEdit::new(
                             target,
-                            source: origin.source,
-                            width: origin.width,
-                            height: origin.height,
-                            crop: origin.crop,
-                            turns: origin.turns,
-                        });
+                            origin.source,
+                            origin.width,
+                            origin.height,
+                        );
+                        edit.crop = origin.crop;
+                        edit.turns = origin.turns;
+                        edit.strokes = origin.strokes;
+                        edit.overlays = origin.overlays;
+                        self.picture_edit = Some(edit);
                     } else if Pending::is_picture_file(&path) {
                         // Its size has to be read before the cropper can open
                         // on it, and only this answer may open it.
@@ -8545,6 +8548,8 @@ impl App {
                             height: edit.height,
                             crop: edit.crop,
                             turns: edit.turns,
+                            strokes: edit.strokes.clone(),
+                            overlays: edit.overlays.clone(),
                         },
                     );
                     self.backend.send(Command::ApplyPictureEdit {
@@ -8554,6 +8559,8 @@ impl App {
                         height: edit.height,
                         crop: edit.crop,
                         turns: edit.turns,
+                        strokes: edit.strokes,
+                        overlays: edit.overlays,
                     });
                 }
             }
@@ -13328,6 +13335,8 @@ mod tests {
                 height: 6,
                 crop: crate::model::PictureCrop::full(8, 6),
                 turns: 0,
+                strokes: Vec::new(),
+                overlays: Vec::new(),
             },
         );
         let first_id = app.account().id.clone();
@@ -22465,6 +22474,8 @@ mod tests {
                 height: 4,
                 crop: crate::model::PictureCrop::full(4, 4),
                 turns: 0,
+                strokes: Vec::new(),
+                overlays: Vec::new(),
             },
         );
         // Unstaged while its crop is still being written.
